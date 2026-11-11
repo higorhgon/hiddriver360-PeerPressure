@@ -1,4 +1,4 @@
-From dfaa052fb7fea8a7559ae472b0bf45e8caaf2af2 Mon Sep 17 00:00:00 2001
+From 28d565c7d8836d490e4f9692e68aedf6498bc4fe Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 11 Nov 2026 07:04:02 +0000
 Subject: [PATCH] Present the Guitar Hero Live PS4 dongle as the Xbox 360 GHL
@@ -8,6 +8,14 @@ The PS4 GHL dongle (1430:07bb) is a plain HID device, so hiddriver already
 claims it, but it then went through the generic mapping process and was
 reported to games as a gamepad. Guitar Hero Live on the 360 only accepts its
 guitar: XInput subtype Guitar Alternate (7) with flags 0x1C.
+
+Plugging the dongle in also hung the console at once, before the mapping
+notification. setConfigurationComplete dereferenced reportInfo before
+checking the parse result, and a failed parse leaves it nullptr; that
+happens at DISPATCH in the USB completion. The check now comes first (for
+every device), a missing interrupt IN endpoint fails cleanly, and the GHL
+dongle's descriptor is not parsed at all, since its report is read with a
+fixed layout.
 
 For this dongle only:
 - skip the mapping process and convert its report with a fixed table
@@ -26,11 +34,11 @@ Untested on hardware.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- hiddriver/main.cpp | 161 +++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 161 insertions(+)
+ hiddriver/main.cpp | 218 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 196 insertions(+), 22 deletions(-)
 
 diff --git a/hiddriver/main.cpp b/hiddriver/main.cpp
-index 890fd56..92cc3e1 100644
+index 890fd56..ef33cc4 100644
 --- a/hiddriver/main.cpp
 +++ b/hiddriver/main.cpp
 @@ -300,6 +300,34 @@ enum DS3_FEATURE_VALUE
@@ -80,7 +88,79 @@ index 890fd56..92cc3e1 100644
  } __declspec(align(4));
  
  struct MappingState {
-@@ -772,6 +805,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
+@@ -514,36 +547,49 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
+ 		g_InitState = InitState::INIT_DONE;
+ 
+ 		HID_ReportInfo_t* reportInfo = nullptr;
+-		uint8_t parseResult = USB_ProcessHIDReport((const uint8_t*)reportDescriptorBuffer,
+-			hidDescriptorBuffer.wDescriptorLength,
+-			&reportInfo);
+-
+-		c.reportInfo = reportInfo;
+-		c.reportId = FindGamepadReportId(reportInfo);
+-
+-		DbgPrint("EINTIM: Parsed descriptor. UsingReportIDs: %d, Report ID: %d\r\n",
+-			(int)reportInfo->UsingReportIDs, c.reportId);
+-
+-		if (parseResult != HID_PARSE_Successful || !reportInfo) {
+-			DbgPrint("EINTIM: Failed to parse HID descriptor: error %d\r\n", parseResult);
+-			g_InitState = InitState::INIT_FAILED;
+-			free(reportDescriptorBuffer);
+-			return -1;
++		if (IsGhlPs4Dongle(c.vendorId, c.productId)) {
++			// The GHL dongle is read with a fixed layout (GhlFillButtonsReport), so its descriptor
++			// isn't parsed at all: plugging it in used to hang the console with no notification,
++			// i.e. before the mapping process, and the parser is the likely cause.
++			DbgPrint("EINTIM: GHL dongle: skipping report descriptor parsing\r\n");
++			c.reportInfo = nullptr;
++			c.reportId = 0x01;
+ 		}
++		else {
++			uint8_t parseResult = USB_ProcessHIDReport((const uint8_t*)reportDescriptorBuffer,
++				hidDescriptorBuffer.wDescriptorLength,
++				&reportInfo);
++
++			// Check before touching reportInfo: on a failed parse it stays nullptr, and
++			// dereferencing it here (DISPATCH, USB completion) brings the console down.
++			if (parseResult != HID_PARSE_Successful || !reportInfo) {
++				DbgPrint("EINTIM: Failed to parse HID descriptor: error %d\r\n", parseResult);
++				g_InitState = InitState::INIT_FAILED;
++				free(reportDescriptorBuffer);
++				return -1;
++			}
+ 
+-		DbgPrint("EINTIM: parse done stage 1\r\n");
+-		g_InitState = InitState::INIT_DONE;
+-
+-		c.reportInfo = reportInfo;
+-		c.reportId = FindGamepadReportId(reportInfo);
++			DbgPrint("EINTIM: parse done stage 1\r\n");
++			c.reportInfo = reportInfo;
++			c.reportId = FindGamepadReportId(reportInfo);
+ 
+-		DbgPrint("EINTIM: Parsed descriptor. UsingReportIDs: %d, Report ID: %d\r\n",
+-			(int)reportInfo->UsingReportIDs, c.reportId);
++			DbgPrint("EINTIM: Parsed descriptor. UsingReportIDs: %d, Report ID: %d\r\n",
++				(int)reportInfo->UsingReportIDs, c.reportId);
++		}
+ 
+ 		free(reportDescriptorBuffer);
+ 
+ 		usb_endpoint_descriptor* endpoint_descriptor = UsbdGetEndpointDescriptor(
+ 			controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_IN);
++		if (!endpoint_descriptor) {
++			DbgPrint("EINTIM: No interrupt IN endpoint!\n");
++			g_InitState = InitState::INIT_FAILED;
++			if (c.reportInfo) {
++				USB_FreeReportInfo(c.reportInfo);
++				c.reportInfo = nullptr;
++			}
++			return -1;
++		}
+ 
+ 		status = UsbdOpenEndpoint(
+ 			controllerDriver->deviceHandle,
+@@ -772,6 +818,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
  			if (connectedControllers[i].controllerDriver &&
  				connectedControllers[i].reportInfo &&
  				!connectedControllers[i].map &&
@@ -88,7 +168,7 @@ index 890fd56..92cc3e1 100644
  				!g_mappingState.active) {
  
  				DbgPrint("EINTIM: Starting mapping for controller %d (VID:%04x PID:%04x)\n",
-@@ -1059,6 +1093,86 @@ unsigned int __stdcall MappingThreadProc(void* param) {
+@@ -1059,6 +1106,86 @@ unsigned int __stdcall MappingThreadProc(void* param) {
  	return 0;
  }
  
@@ -175,7 +255,7 @@ index 890fd56..92cc3e1 100644
  int interruptHandler(DWORD deviceHandle, int32_t a2) {
  	HidControllerExtension* driverExtension = (HidControllerExtension*)((deviceHandle - 4));
  	Report* report = (Report*)driverExtension->interruptTrb.buffer;
-@@ -1110,6 +1224,24 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
+@@ -1110,6 +1237,24 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
  		}
  	}
  
@@ -200,7 +280,7 @@ index 890fd56..92cc3e1 100644
  	bool hasReportId = connectedControllers[index].reportInfo &&
  		connectedControllers[index].reportInfo->UsingReportIDs; 
  	if (report->reportId == connectedControllers[index].reportId || !hasReportId) {
-@@ -1337,6 +1469,11 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
+@@ -1337,6 +1482,11 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
  		c.vendorId = vendorId;
  		c.productId = productId;
  		c.map = FindMapping(vendorId, productId);
@@ -212,7 +292,7 @@ index 890fd56..92cc3e1 100644
  		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
  
  		HidControllerExtension* controllerDriver = new HidControllerExtension();
-@@ -1437,6 +1574,30 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
+@@ -1437,6 +1587,30 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
  		capabilities->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
  		capabilities->Flags = 0;
  

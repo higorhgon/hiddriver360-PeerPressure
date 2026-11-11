@@ -155,6 +155,10 @@ It is the 360 counterpart of [GHL-PS4onPS3](https://github.com/higorhgon/GHL-PS4
 **Not tested on hardware yet**, and `hiddriver/prebuilt/hiddriver.xex` doesn't include it:
 build the driver with both patches ([`hiddriver/BUILDING.md`](hiddriver/BUILDING.md)).
 
+Plugging this dongle in used to hang the console at once (no mapping notification): hiddriver
+read the parsed HID descriptor before checking whether parsing had failed. The patch fixes that
+order for every device, and doesn't parse this dongle's descriptor at all.
+
 For this dongle the driver:
 
 - skips the on-screen mapping and converts its report with a fixed table:
