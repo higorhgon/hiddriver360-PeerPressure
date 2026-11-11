@@ -6,10 +6,15 @@ EinTim23 (GPL-3.0) at upstream commit
 [`0001-Keep-USB-transfer-state-out-of-the-loader-s-process-.patch`](0001-Keep-USB-transfer-state-out-of-the-loader-s-process-.patch)
 applied. Building it needs an Xbox 360 XDK, which can't be distributed (so it can't be built in CI).
 
+[`0002-Present-the-Guitar-Hero-Live-PS4-dongle-as-the-Xbox-.patch`](0002-Present-the-Guitar-Hero-Live-PS4-dongle-as-the-Xbox-.patch)
+adds the Guitar Hero Live PS4 guitar (see the README). It is **not in the prebuilt binary yet**:
+apply it too to build a driver with guitar support.
+
 ```
 git clone https://github.com/EinTim23/hiddriver360 && cd hiddriver360
 git checkout 6159866
 git am ../hiddriver/0001-Keep-USB-transfer-state-out-of-the-loader-s-process-.patch
+git am ../hiddriver/0002-Present-the-Guitar-Hero-Live-PS4-dongle-as-the-Xbox-.patch   # GHL guitar
 ```
 
 Then build `hiddriver.vcxproj` (Release) with the XDK's Visual Studio integration, or by hand:

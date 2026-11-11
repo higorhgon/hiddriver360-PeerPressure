@@ -147,6 +147,38 @@ mapping process; mappings are saved to `Hdd1:\hiddriver.json`.
   digits) and set `TitleID`. Dashboards without a title ID can only be reached through
   `AuroraFixer.xex` (see below).
 
+## Guitar Hero Live PS4 guitar (experimental)
+
+[`hiddriver/0002-*.patch`](hiddriver/) makes the **PS4 Guitar Hero Live guitar and dongle**
+(USB `1430:07bb`) show up as the Xbox 360 GHL guitar, so Guitar Hero Live on the 360 can use it.
+It is the 360 counterpart of [GHL-PS4onPS3](https://github.com/higorhgon/GHL-PS4onPS3).
+**Not tested on hardware yet**, and `hiddriver/prebuilt/hiddriver.xex` doesn't include it:
+build the driver with both patches ([`hiddriver/BUILDING.md`](hiddriver/BUILDING.md)).
+
+For this dongle the driver:
+
+- skips the on-screen mapping and converts its report with a fixed table:
+
+  | Guitar | PS4 dongle | Xbox 360 GHL |
+  |---|---|---|
+  | Black 1, 2, 3 | ×, ○, △ | A, B, Y |
+  | White 1, 2, 3 | □, L1, R1 | X, LB, RB |
+  | Strum bar | left stick Y | D-pad up/down + left stick Y |
+  | Whammy | right stick Y (`0x80`–`0xFF`) | right stick Y, 0 – 32767 |
+  | Tilt | right stick X | right stick X (up = positive) |
+  | Pause / Hero Power / GHTV | Options / R3 / L3 | Start / Back / left stick click |
+  | Centre button | PS | Guide |
+
+- sends the PS4 keep-alive (`SET_REPORT 0x30`) on connect and every 8 s; without it the dongle
+  drops held frets when you strum;
+- reports XInput subtype **Guitar Alternate (7)** with flags **`0x1C`** (what the 360 GHL guitar
+  reports, per [PlasticBand](https://github.com/TheNathannator/PlasticBand)), the guitar's inputs
+  as its capabilities, and the 360 dongle's vendor/product id in the extended capability fields.
+
+What to check first: whether the game gets past *"connect a guitar"*. If it doesn't, the
+capabilities are the suspect (the vendor/product id and its position in the structure are guesses);
+the debug output (`EINTIM: GHL ...` lines) shows what the driver reported.
+
 ## How it works
 
 **Loading.** PeerPressure's `KernelExpansion.bin` sideloads DLLs into titles at launch:

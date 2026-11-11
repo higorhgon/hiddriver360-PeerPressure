@@ -1,0 +1,248 @@
+From dfaa052fb7fea8a7559ae472b0bf45e8caaf2af2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 07:04:02 +0000
+Subject: [PATCH] Present the Guitar Hero Live PS4 dongle as the Xbox 360 GHL
+ guitar
+
+The PS4 GHL dongle (1430:07bb) is a plain HID device, so hiddriver already
+claims it, but it then went through the generic mapping process and was
+reported to games as a gamepad. Guitar Hero Live on the 360 only accepts its
+guitar: XInput subtype Guitar Alternate (7) with flags 0x1C.
+
+For this dongle only:
+- skip the mapping process and convert its report with a fixed table
+  (frets to A/B/Y/X/LB/RB, strum bar to D-pad up/down and left stick Y,
+  whammy to right stick Y 0..32767, tilt to right stick X, Pause/Hero
+  Power/GHTV/centre button to Start/Back/LS/Guide), following the
+  PlasticBand PS4 and Xbox 360 GHL layouts;
+- send the PS4 keep-alive (SET_REPORT 0x30, 02 08 0A 00...) on connect and
+  every 8 s from the interrupt handler; without it the dongle drops held
+  frets when strumming;
+- report subtype 7, flags 0x1C and the guitar's inputs (not its current
+  state) from XamInputGetCapabilitiesEx, plus the 360 dongle's vendor and
+  product id in the PC layout of the extended fields (unverified).
+
+Untested on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hiddriver/main.cpp | 161 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 161 insertions(+)
+
+diff --git a/hiddriver/main.cpp b/hiddriver/main.cpp
+index 890fd56..92cc3e1 100644
+--- a/hiddriver/main.cpp
++++ b/hiddriver/main.cpp
+@@ -300,6 +300,34 @@ enum DS3_FEATURE_VALUE
+ };
+ // dualshock 3 specific end
+ 
++// Guitar Hero Live PS4 dongle specific start
++// The PS4 GHL dongle (1430:07bb) is presented to games as the Xbox 360 GHL guitar.
++// Report layouts: TheNathannator/PlasticBand, 6-Fret Guitar (PS4 and Xbox 360 pages); the same
++// PS4 layout and keep-alive are used, tested on hardware, by GHL-PS4onPS3.
++const uint16_t GHL_VENDOR_ID = 0x1430;
++const uint16_t GHL_PS4_PRODUCT_ID = 0x07BB;
++// What the virtual guitar reports in its capabilities, from the PlasticBand Xbox 360 page:
++// type gamepad, subtype Guitar Alternate (7), flags voice | plug-in modules | no navigation.
++// GHL reportedly tells its 6-fret guitar from 5-fret ones by the no-navigation flag.
++#define GHL_XINPUT_SUBTYPE 0x07
++#define GHL_XINPUT_FLAGS   0x001C
++// The Xbox 360 GHL dongle's id, reported in the capabilities' vendor/product fields.
++// UNVERIFIED: both the id and where those fields sit in XINPUT_CAPABILITIES_EX (taken from the
++// PC layout: VendorId, ProductId, VersionNumber after Vibration). See XamInputGetCapabilitiesExHook.
++#define GHL_X360_PRODUCT_ID 0x070B
++// Keep-alive: SET_REPORT (output, id 0x30). Without it the dongle drops held frets whenever the
++// strum bar moves. Has to be repeated at least every 8 s.
++#define GHL_KEEPALIVE_PERIOD_MS 8000
++__declspec(align(16)) static unsigned char g_ghlKeepAlive[16] = {
++	0x30, 0x02, 0x08, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++#define GHL_KEEPALIVE_LENGTH 9
++
++bool IsGhlPs4Dongle(uint16_t vid, uint16_t pid) {
++	return vid == GHL_VENDOR_ID && pid == GHL_PS4_PRODUCT_ID;
++}
++// Guitar Hero Live PS4 dongle specific end
++
+ typedef usb_device_descriptor* (*usb_device_descriptor_func_t)(deviceHandle* handle);
+ typedef usb_interface_descriptor* (*usb_interface_descriptor_func_t)(deviceHandle* handle);
+ typedef int(*usb_add_device_complete_func_t)(deviceHandle* handle, int status_code);
+@@ -353,6 +381,11 @@ struct Controller {
+ 	// for nintendo specific handshake
+ 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
+ 	UsbTrb interruptTrb;
++
++	// for the Guitar Hero Live PS4 dongle
++	volatile bool ghlKeepAliveBusy;   // keep-alive SET_REPORT queued on the control endpoint
++	DWORD ghlLastKeepAlive;           // GetTickCount() of the last one sent
++	bool ghlLogged;                   // first report logged
+ } __declspec(align(4));
+ 
+ struct MappingState {
+@@ -772,6 +805,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
+ 			if (connectedControllers[i].controllerDriver &&
+ 				connectedControllers[i].reportInfo &&
+ 				!connectedControllers[i].map &&
++				!IsGhlPs4Dongle(connectedControllers[i].vendorId, connectedControllers[i].productId) &&
+ 				!g_mappingState.active) {
+ 
+ 				DbgPrint("EINTIM: Starting mapping for controller %d (VID:%04x PID:%04x)\n",
+@@ -1059,6 +1093,86 @@ unsigned int __stdcall MappingThreadProc(void* param) {
+ 	return 0;
+ }
+ 
++// Completion of the GHL keep-alive. The argument is the control TRB (see setConfigurationComplete).
++int32_t ghlKeepAliveComplete(DWORD trb, int32_t status) {
++	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)trb - 36);
++	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
++		if (connectedControllers[i].controllerDriver == controllerDriver) {
++			connectedControllers[i].ghlKeepAliveBusy = false;
++			break;
++		}
++	}
++	if (status != 0)
++		DbgPrint("EINTIM: GHL keep-alive failed with status %x\n", status);
++	return 0;
++}
++
++// Called for every report from the GHL dongle (DISPATCH level, from interruptHandler).
++void GhlSendKeepAliveIfDue(Controller* c, HidControllerExtension* driverExtension) {
++	DWORD now = GetTickCount();
++	if (c->ghlKeepAliveBusy)
++		return;
++	if (c->ghlLastKeepAlive && now - c->ghlLastKeepAlive < GHL_KEEPALIVE_PERIOD_MS)
++		return;
++	c->ghlKeepAliveBusy = true;
++	c->ghlLastKeepAlive = now ? now : 1;
++	SendControlRequest(driverExtension->deviceHandle,
++		&driverExtension->controlTrb,
++		0x21,                                   // host to device, class, interface
++		0x09,                                   // SET_REPORT
++		0x0200 | g_ghlKeepAlive[0],             // output report 0x30
++		driverExtension->interfaceNumber,
++		GHL_KEEPALIVE_LENGTH,
++		g_ghlKeepAlive,
++		(DWORD)ghlKeepAliveComplete);
++}
++
++int16_t GhlCenteredAxis(uint8_t raw) {
++	// 0x00..0xFF centred at 0x80 -> -32768..32767
++	int32_t v = ((int32_t)raw - 0x80) * 256;
++	if (raw == 0xFF) v = 32767;
++	return (int16_t)v;
++}
++
++// PS4 GHL report (r[0] = report id 0x01) -> what the Xbox 360 GHL guitar sends:
++//   frets: Black 1/2/3 = A/B/Y, White 1/2/3 = X/LB/RB
++//   strum bar: D-pad up/down and left stick Y (up = positive)
++//   whammy: right stick Y, 0 (released) .. 32767 (pressed)
++//   tilt: right stick X, positive = up
++//   Pause = Start, Hero Power = Back, GHTV = left stick click, centre button = Guide
++void GhlFillButtonsReport(const uint8_t* r, ButtonsReport* out) {
++	uint8_t b5 = r[5], b6 = r[6], b7 = r[7];
++	uint8_t strum = r[2], tilt = r[3], whammy = r[4];
++	uint8_t hat = b5 & 0x0F;
++
++	out->x_button = (b5 & 0x10) ? 1 : 0;   // White 1 (Square)
++	out->a_button = (b5 & 0x20) ? 1 : 0;   // Black 1 (Cross)
++	out->b_button = (b5 & 0x40) ? 1 : 0;   // Black 2 (Circle)
++	out->y_button = (b5 & 0x80) ? 1 : 0;   // Black 3 (Triangle)
++	out->l1 = (b6 & 0x01) ? 1 : 0;         // White 2 (L1)
++	out->r1 = (b6 & 0x02) ? 1 : 0;         // White 3 (R1)
++	out->start = (b6 & 0x20) ? 1 : 0;      // Pause (Options)
++	out->l3 = (b6 & 0x40) ? 1 : 0;         // GHTV (L3)
++	out->back = (b6 & 0x80) ? 1 : 0;       // Hero Power (R3)
++	out->xbox = (b7 & 0x01) ? 1 : 0;       // centre button (PS)
++
++	// D-pad from the hat (neutral is 8) plus the strum bar.
++	out->has_hat_switch = false;
++	out->dpad_up = (hat == HAT_UP || hat == HAT_UP_RIGHT || hat == HAT_UP_LEFT || strum < 0x40) ? 1 : 0;
++	out->dpad_down = (hat == HAT_DOWN || hat == HAT_DOWN_RIGHT || hat == HAT_DOWN_LEFT || strum > 0xC0) ? 1 : 0;
++	out->dpad_right = (hat == HAT_UP_RIGHT || hat == HAT_RIGHT || hat == HAT_DOWN_RIGHT) ? 1 : 0;
++	out->dpad_left = (hat == HAT_DOWN_LEFT || hat == HAT_LEFT || hat == HAT_UP_LEFT) ? 1 : 0;
++
++	out->x = 0;
++	out->y = (int16_t)-GhlCenteredAxis(strum);   // 0x00 = up -> positive
++	if (strum == 0x00) out->y = 32767;
++	out->z = GhlCenteredAxis(tilt);               // right stick X: 0xFF = tilted up
++	int32_t w = whammy > 0x80 ? ((int32_t)(whammy - 0x80) * 32767) / 0x7F : 0;
++	out->rz = (int16_t)w;                         // right stick Y
++	out->rx = 0;                                  // no triggers
++	out->ry = 0;
++}
++
+ int interruptHandler(DWORD deviceHandle, int32_t a2) {
+ 	HidControllerExtension* driverExtension = (HidControllerExtension*)((deviceHandle - 4));
+ 	Report* report = (Report*)driverExtension->interruptTrb.buffer;
+@@ -1110,6 +1224,24 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
+ 		}
+ 	}
+ 
++	if (index != -1 && IsGhlPs4Dongle(connectedControllers[index].vendorId, connectedControllers[index].productId)) {
++		Controller* ghl = &connectedControllers[index];
++		const uint8_t* raw = (const uint8_t*)report;
++		GhlSendKeepAliveIfDue(ghl, driverExtension);
++		if (raw[0] == 0x01) {
++			if (!ghl->ghlLogged) {
++				ghl->ghlLogged = true;
++				DbgPrint("EINTIM: GHL first report: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++					raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
++			}
++			ButtonsReport buttonReport;
++			memset(&buttonReport, 0, sizeof(ButtonsReport));
++			GhlFillButtonsReport(raw, &buttonReport);
++			ghl->currentState = buttonReport;
++		}
++		return UsbdQueueAsyncTransfer(driverExtension->deviceHandle, &driverExtension->interruptTrb);
++	}
++
+ 	bool hasReportId = connectedControllers[index].reportInfo &&
+ 		connectedControllers[index].reportInfo->UsingReportIDs; 
+ 	if (report->reportId == connectedControllers[index].reportId || !hasReportId) {
+@@ -1337,6 +1469,11 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
+ 		c.vendorId = vendorId;
+ 		c.productId = productId;
+ 		c.map = FindMapping(vendorId, productId);
++		if (IsGhlPs4Dongle(vendorId, productId)) {
++			// Fixed conversion (GhlFillButtonsReport); a saved mapping would not be used.
++			DbgPrint("EINTIM: Guitar Hero Live PS4 dongle: presenting it as the Xbox 360 GHL guitar\n");
++			c.map = nullptr;
++		}
+ 		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
+ 
+ 		HidControllerExtension* controllerDriver = new HidControllerExtension();
+@@ -1437,6 +1574,30 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
+ 		capabilities->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+ 		capabilities->Flags = 0;
+ 
++		if (IsGhlPs4Dongle(c->vendorId, c->productId)) {
++			capabilities->SubType = GHL_XINPUT_SUBTYPE;
++			capabilities->Flags = GHL_XINPUT_FLAGS;
++			// Capabilities, not state: every input the guitar has.
++			memset(&capabilities->Gamepad, 0, sizeof(XINPUT_GAMEPAD));
++			capabilities->Gamepad.wButtons = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
++				XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT |
++				XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_LEFT_THUMB |
++				XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER |
++				XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y;
++			capabilities->Gamepad.sThumbLY = (SHORT)0xFFC0;
++			capabilities->Gamepad.sThumbRX = (SHORT)0xFFC0;
++			capabilities->Gamepad.sThumbRY = (SHORT)0xFFC0;
++			capabilities->Vibration.wLeftMotorSpeed = 0;
++			capabilities->Vibration.wRightMotorSpeed = 0;
++			// VendorId / ProductId / VersionNumber, PC layout (unverified on the 360).
++			capabilities->unk1 = ((DWORD)GHL_VENDOR_ID << 16) | GHL_X360_PRODUCT_ID;
++			capabilities->unk2 = 0;
++			capabilities->unk3 = 0;
++			DbgPrint("EINTIM: GHL capabilities for user %d: subtype %02x flags %04x\n",
++				(int)user, capabilities->SubType, capabilities->Flags);
++			return ERROR_SUCCESS;
++		}
++
+ 		XINPUT_STATE state;
+ 		memset(&state, 0, sizeof(XINPUT_STATE));
+ 		XInputGetState(user, &state);
+-- 
+2.43.0
+
